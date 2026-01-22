@@ -2,7 +2,7 @@
 using System.Collections.Generic;
 using System.Threading.Tasks;
 
-namespace WSStomp
+namespace AXIPlus
 {
     public class StompSubscription
     {
@@ -31,6 +31,7 @@ namespace WSStomp
         public Task Unsubscribe()
         {
             var headers = new Dictionary<string, string> { { "id", _headers["id"] }, { "destination", _headers["destination"] } };
+            _stomp.Subscriptions.Remove(GetId());
             return _stomp.SendStompCommand(StompCommand.Unsubscribe(), headers, null);
         }
 

@@ -1,4 +1,4 @@
-﻿namespace WSStomp
+﻿namespace AXIPlus
 {
     public class StompCommand
     {

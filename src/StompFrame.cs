@@ -1,6 +1,6 @@
 ﻿using System.Collections.Generic;
 
-namespace WSStomp
+namespace AXIPlus
 {
     public class StompFrame
     {
@@ -23,11 +23,6 @@ namespace WSStomp
         public string MessageId { get; set; }
         public string Destination { get; set; }
         public string ContentType { get; set; }
-    }
-
-    public class StompReceipt : StompFrame
-    {
-        public string ReceiptId { get; set; }
     }
 
     public class StompError : StompFrame

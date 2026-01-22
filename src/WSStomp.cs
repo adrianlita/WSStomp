@@ -6,74 +6,121 @@ using System.Threading;
 using System.Threading.Tasks;
 using JetBrains.Annotations;
 
-namespace WSStomp
+namespace AXIPlus
 {
     public class WsStomp
     {
+        private ClientWebSocket _client = new ClientWebSocket();
+        
         private readonly StringBuilder _buffer = new StringBuilder(); // Shared buffer
         private readonly object _bufferLock = new object(); // Lock object for thread safety
-        private readonly ClientWebSocket _client = new ClientWebSocket();
-
+        private readonly SemaphoreSlim _sendReceiveLock = new SemaphoreSlim(1, 1);
+        
         private readonly Dictionary<string, string> _headers = new Dictionary<string, string>
         {
             { "accept-version", "1.2" },
-            { "heart-beat", "10000,10000" }
+            { "heart-beat", "0,0" }
         };
-
-        private readonly Dictionary<string, StompSubscription> _subscriptions = new Dictionary<string, StompSubscription>();
-        private readonly CancellationToken _cancellationToken = CancellationToken.None;
+        
+        private Uri _uri;
 
         private TaskCompletionSource<bool> _connectCompletionSource;
-        private int _nextSubscriptionId;
+        private int _nextSubscriptionId = -1;
+        
+        private readonly CancellationTokenSource _disconnectCancellationToken = new CancellationTokenSource();
+        
+        public delegate void StompConnectedEventHandler(object sender, StompConnected e);
+        public delegate void StompDisconnectedEventHandler(object sender);
+        public delegate void StompErrorEventHandler(object sender, StompError e);
+        
+        public event StompConnectedEventHandler StompOnConnected;
+        public event StompDisconnectedEventHandler StompOnDisconnected;
+        public event StompDisconnectedEventHandler StompOnConnectFailed;
+        public event StompErrorEventHandler StompOnError;
+        
+        internal readonly Dictionary<string, StompSubscription> Subscriptions = new Dictionary<string, StompSubscription>();
+        public bool Connected => _client.State == WebSocketState.Open;
 
+        [PublicAPI]
         public void SetHttpHeader([NotNull] string headerName, [NotNull] string headerValue)
         {
             _client.Options.SetRequestHeader(headerName, headerValue);
         }
 
+        [PublicAPI]
         public void SetStompHeader([NotNull] string headerName, [NotNull] string headerValue)
         {
             _headers.Add(headerName, headerValue);
         }
-
+        
+        [PublicAPI]
         [NotNull]
-        public async Task ConnectAsync([NotNull] Uri uri, CancellationToken cancellationToken)
+        public async Task<bool> ConnectAsync([NotNull] Uri uri)
         {
-            if (_connectCompletionSource != null) throw new InvalidOperationException("ConnectAsync is already in progress.");
+            _uri = uri;
 
+            if (_connectCompletionSource != null)
+            {
+                throw new InvalidOperationException("ConnectAsync is already in progress.");
+            }
             _connectCompletionSource = new TaskCompletionSource<bool>();
 
             try
             {
-                await _client.ConnectAsync(uri, cancellationToken);
+                await _client.ConnectAsync(uri, CancellationToken.None);
                 _ = StartReceivingAsync();
                 await SendStompCommand(StompCommand.Connect(), _headers, null);
                 await _connectCompletionSource.Task;
+                return true;
+            }
+            catch (Exception)
+            {
+                _connectCompletionSource = null;
+                HandleDisconnection();
+                StompOnConnectFailed?.Invoke(this);
             }
             finally
             {
                 _connectCompletionSource = null;
             }
+
+            return false;
         }
 
+        [PublicAPI]
         [NotNull]
-        public async Task CloseAsync(WebSocketCloseStatus closeStatus, [NotNull] string statusDescription, CancellationToken cancellationToken)
+        public async Task ReconnectAsync()
         {
-            // cancellationToken. checkAL
-            await SendStompCommand(StompCommand.Disconnect(), null, null);
-            await _client.CloseAsync(closeStatus, statusDescription, cancellationToken);
+            if (await ConnectAsync(_uri))
+            {
+                foreach (var subscription in Subscriptions.Values)
+                {
+                    await subscription.Subscribe(null);
+                }
+            }
         }
 
+        [PublicAPI]
+        [NotNull]
+        public async Task CloseAsync()
+        {
+            _disconnectCancellationToken.Cancel();
+            await SendStompCommand(StompCommand.Disconnect(), null, null);
+            await _client.CloseAsync(WebSocketCloseStatus.NormalClosure, "Disconnecting", CancellationToken.None);
+        }
+
+        [PublicAPI]
         [NotNull]
         public async Task<StompSubscription> SubscribeAsync([NotNull] string destination, Func<StompMessage, Task> messageHandler)
         {
             var id = "sub-" + Interlocked.Increment(ref _nextSubscriptionId);
             var subscription = new StompSubscription(this, id, destination);
             await subscription.Subscribe(messageHandler);
-            _subscriptions.Add(id, subscription);
+            Subscriptions.Add(id, subscription);
             return subscription;
         }
 
+        [PublicAPI]
         public async Task SendAsync([NotNull] string destination, [CanBeNull] string body)
         {
             var headers = new Dictionary<string, string>
@@ -83,6 +130,7 @@ namespace WSStomp
             await SendStompCommand(StompCommand.Send(), headers, body);
         }
 
+        [PublicAPI]
         internal async Task SendStompCommand([NotNull] StompCommand command, [CanBeNull] Dictionary<string, string> headers, [CanBeNull] string body)
         {
             if (headers == null) headers = new Dictionary<string, string>();
@@ -100,8 +148,21 @@ namespace WSStomp
             var frame = command.GetValue() + "\n" + hdrs + "\n" + body + "\0";
             var buffer = Encoding.UTF8.GetBytes(frame);
 
-            Console.WriteLine(frame);
-            await _client.SendAsync(new ArraySegment<byte>(buffer), WebSocketMessageType.Text, true, CancellationToken.None);
+            await _sendReceiveLock.WaitAsync();
+            try
+            {
+                await _client.SendAsync(new ArraySegment<byte>(buffer), WebSocketMessageType.Text, true, CancellationToken.None);
+            }
+            finally
+            {
+                _sendReceiveLock.Release();
+            }
+        }
+
+        private void HandleDisconnection()
+        {
+            _client.Dispose();
+            _client = new ClientWebSocket();
         }
 
         private async Task StartReceivingAsync()
@@ -114,14 +175,21 @@ namespace WSStomp
 
                 try
                 {
-                    result = await _client.ReceiveAsync(segment, _cancellationToken);
+                    result = await _client.ReceiveAsync(segment, _disconnectCancellationToken.Token);
                 }
                 catch (WebSocketException)
                 {
                     break; // Handle as needed
                 }
+                catch (OperationCanceledException)
+                {
+                    break; // Handle as needed
+                }
 
-                if (result.MessageType == WebSocketMessageType.Close) break;
+                if (result.MessageType == WebSocketMessageType.Close)
+                {
+                    break;
+                }
 
 
                 var data = Encoding.UTF8.GetString(buffer, 0, result.Count);
@@ -142,6 +210,9 @@ namespace WSStomp
                     }
                 }
             }
+            
+            HandleDisconnection();
+            StompOnDisconnected?.Invoke(this);
         }
 
         private StompFrame ProcessFrame(string rawMessage)
@@ -195,19 +266,10 @@ namespace WSStomp
                         Headers = headers,
                         Body = body.ToString(),
 
-                        Subscription = _subscriptions[headers["subscription"]],
+                        Subscription = Subscriptions[headers["subscription"]],
                         MessageId = headers.TryGetValue("message-id", out var messageId) ? messageId : null,
                         Destination = headers.TryGetValue("destination", out var destination) ? destination : null,
                         ContentType = headers.TryGetValue("content-type", out var contentType) ? contentType : null
-                    };
-                }
-                case "RECEIPT":
-                {
-                    return new StompReceipt
-                    {
-                        Command = command,
-                        Headers = headers,
-                        ReceiptId = headers.TryGetValue("receipt-id", out var receiptId) ? receiptId : null
                     };
                 }
                 case "ERROR":
@@ -239,6 +301,7 @@ namespace WSStomp
                 case StompConnected connected:
                 {
                     _connectCompletionSource?.TrySetResult(true);
+                    StompOnConnected?.Invoke(this, connected);
                 }
                     break;
 
@@ -247,14 +310,11 @@ namespace WSStomp
                     await message.Subscription.OnMessage(message);
                 }
                     break;
-
-                case StompReceipt receipt:
-                {
-                }
-                    break;
-
+                
                 case StompError error:
                 {
+                    _connectCompletionSource?.TrySetResult(false);
+                    StompOnError?.Invoke(this, error);
                 }
                     break;
             }
